@@ -3,7 +3,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 
-/* Fixed-capacity ring buffer guarded by one mutex and two condition variables. */
+/* 하나의 mutex와 두 개의 조건변수로 보호되는 고정 크기 링 버퍼 큐. */
 struct job_queue {
     job_t **buffer;
     size_t capacity;
@@ -18,7 +18,7 @@ struct job_queue {
 
 job_queue_t *g_queue = NULL;
 
-/* Allocate queue storage and initialize synchronization primitives. */
+/* 큐 저장공간을 할당하고 동기화 객체를 초기화한다. */
 job_queue_t *queue_init(size_t capacity)
 {
     job_queue_t *q;
@@ -68,7 +68,7 @@ job_queue_t *queue_init(size_t capacity)
     return q;
 }
 
-/* Block while the queue is full, unless shutdown has started. */
+/* 큐가 가득 찼으면 대기하고, shutdown 이후에는 push를 거부한다. */
 int queue_push(job_queue_t *q, job_t *job)
 {
     if (q == NULL || job == NULL) {
@@ -95,7 +95,7 @@ int queue_push(job_queue_t *q, job_t *job)
     return 0;
 }
 
-/* Block while the queue is empty, and return NULL only after shutdown drains it. */
+/* 큐가 비어 있으면 대기하고, shutdown 후 비워진 경우에만 NULL을 반환한다. */
 job_t *queue_pop(job_queue_t *q)
 {
     job_t *job;
@@ -125,7 +125,7 @@ job_t *queue_pop(job_queue_t *q)
     return job;
 }
 
-/* Wake every blocked producer and consumer so they can observe shutdown. */
+/* 대기 중인 producer와 consumer를 모두 깨워 shutdown을 관찰하게 한다. */
 void queue_shutdown(job_queue_t *q)
 {
     if (q == NULL) {
@@ -139,7 +139,7 @@ void queue_shutdown(job_queue_t *q)
     pthread_mutex_unlock(&q->mutex);
 }
 
-/* Release queue-owned memory after all producers and consumers have stopped. */
+/* 모든 producer/consumer가 멈춘 뒤 큐가 소유한 자원을 해제한다. */
 void queue_destroy(job_queue_t *q)
 {
     if (q == NULL) {

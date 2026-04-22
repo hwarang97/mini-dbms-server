@@ -6,14 +6,14 @@
 
 #include "job_queue.h"
 
-/* Small barrier used to confirm worker threads are blocked before shutdown. */
+/* shutdown 전에 스레드가 실제로 대기 상태에 들어갔는지 맞추는 작은 배리어. */
 typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     int count;
 } start_latch_t;
 
-/* Producer configuration for pushing a contiguous slice of jobs. */
+/* 연속된 job 구간을 push하는 producer 설정. */
 typedef struct {
     job_queue_t *queue;
     job_t *jobs;
@@ -21,14 +21,14 @@ typedef struct {
     int count;
 } producer_args_t;
 
-/* Consumer configuration for preserving observed dequeue order. */
+/* dequeue 순서를 그대로 기록하는 consumer 설정. */
 typedef struct {
     job_queue_t *queue;
     int *output;
     int count;
 } ordered_consumer_args_t;
 
-/* Consumer configuration for counting every consumed job exactly once. */
+/* 소비된 각 job이 정확히 한 번만 나왔는지 세는 consumer 설정. */
 typedef struct {
     job_queue_t *queue;
     int *seen;
@@ -36,14 +36,14 @@ typedef struct {
     pthread_mutex_t *seen_mutex;
 } counting_consumer_args_t;
 
-/* Thread arguments for poppers that should wake up on shutdown. */
+/* shutdown 시 깨어나야 하는 pop 대기 스레드 인자. */
 typedef struct {
     job_queue_t *queue;
     start_latch_t *latch;
     job_t *result;
 } pop_waiter_args_t;
 
-/* Thread arguments for pushers that should fail once shutdown starts. */
+/* shutdown 시작 후 실패해야 하는 push 대기 스레드 인자. */
 typedef struct {
     job_queue_t *queue;
     start_latch_t *latch;
@@ -51,7 +51,7 @@ typedef struct {
     int rc;
 } push_waiter_args_t;
 
-/* Initialize the latch used by blocking wakeup tests. */
+/* blocking wakeup 테스트에서 사용하는 latch를 초기화한다. */
 static void start_latch_init(start_latch_t *latch)
 {
     assert(pthread_mutex_init(&latch->mutex, NULL) == 0);
@@ -59,14 +59,14 @@ static void start_latch_init(start_latch_t *latch)
     latch->count = 0;
 }
 
-/* Release latch resources after the waiting test completes. */
+/* 대기 테스트가 끝난 뒤 latch 자원을 정리한다. */
 static void start_latch_destroy(start_latch_t *latch)
 {
     assert(pthread_cond_destroy(&latch->cond) == 0);
     assert(pthread_mutex_destroy(&latch->mutex) == 0);
 }
 
-/* Record that a waiter has reached its blocking point. */
+/* 대기 스레드가 실제 blocking 지점까지 도달했음을 기록한다. */
 static void start_latch_signal(start_latch_t *latch)
 {
     assert(pthread_mutex_lock(&latch->mutex) == 0);
@@ -75,7 +75,7 @@ static void start_latch_signal(start_latch_t *latch)
     assert(pthread_mutex_unlock(&latch->mutex) == 0);
 }
 
-/* Wait until every helper thread is ready for the shutdown trigger. */
+/* 모든 helper 스레드가 shutdown 트리거를 받을 준비가 될 때까지 기다린다. */
 static void start_latch_wait_for(start_latch_t *latch, int target)
 {
     assert(pthread_mutex_lock(&latch->mutex) == 0);
@@ -85,7 +85,7 @@ static void start_latch_wait_for(start_latch_t *latch, int target)
     assert(pthread_mutex_unlock(&latch->mutex) == 0);
 }
 
-/* Push a fixed batch of jobs into the shared queue. */
+/* 정해진 개수의 job을 공유 큐에 push한다. */
 static void *producer_thread(void *arg)
 {
     producer_args_t *args = (producer_args_t *)arg;
@@ -98,7 +98,7 @@ static void *producer_thread(void *arg)
     return NULL;
 }
 
-/* Pop a fixed batch of jobs and record their dequeue order. */
+/* 정해진 개수의 job을 pop하면서 dequeue 순서를 기록한다. */
 static void *ordered_consumer_thread(void *arg)
 {
     ordered_consumer_args_t *args = (ordered_consumer_args_t *)arg;
@@ -113,7 +113,7 @@ static void *ordered_consumer_thread(void *arg)
     return NULL;
 }
 
-/* Consume until shutdown, counting each observed job id once. */
+/* shutdown까지 계속 소비하면서 각 job id가 한 번만 나왔는지 센다. */
 static void *counting_consumer_thread(void *arg)
 {
     counting_consumer_args_t *args = (counting_consumer_args_t *)arg;
@@ -134,7 +134,7 @@ static void *counting_consumer_thread(void *arg)
     return NULL;
 }
 
-/* Block on pop so shutdown behavior can be asserted. */
+/* pop에서 block시켜 shutdown 동작을 검증한다. */
 static void *pop_waiter_thread(void *arg)
 {
     pop_waiter_args_t *args = (pop_waiter_args_t *)arg;
@@ -144,7 +144,7 @@ static void *pop_waiter_thread(void *arg)
     return NULL;
 }
 
-/* Block on push so shutdown behavior can be asserted. */
+/* push에서 block시켜 shutdown 동작을 검증한다. */
 static void *push_waiter_thread(void *arg)
 {
     push_waiter_args_t *args = (push_waiter_args_t *)arg;
@@ -154,7 +154,7 @@ static void *push_waiter_thread(void *arg)
     return NULL;
 }
 
-/* Verify FIFO order with one producer and one consumer. */
+/* producer 1개, consumer 1개에서 FIFO 순서가 유지되는지 확인한다. */
 static void test_single_producer_single_consumer(void)
 {
     enum { job_count = 128 };
@@ -197,7 +197,7 @@ static void test_single_producer_single_consumer(void)
     queue_destroy(queue);
 }
 
-/* Verify shutdown wakes all consumers blocked on an empty queue. */
+/* 빈 큐에서 대기 중인 모든 consumer가 shutdown으로 깨어나는지 확인한다. */
 static void test_shutdown_wakes_blocked_poppers(void)
 {
     enum { waiter_count = 4 };
@@ -229,7 +229,7 @@ static void test_shutdown_wakes_blocked_poppers(void)
     queue_destroy(queue);
 }
 
-/* Verify shutdown wakes all producers blocked on a full queue. */
+/* 가득 찬 큐에서 대기 중인 모든 producer가 shutdown으로 깨어나는지 확인한다. */
 static void test_shutdown_wakes_blocked_pushers(void)
 {
     enum { waiter_count = 4 };
@@ -273,7 +273,7 @@ static void test_shutdown_wakes_blocked_pushers(void)
     queue_destroy(queue);
 }
 
-/* Run a shared multi-threaded workload and check for loss or duplication. */
+/* 다중 스레드 workload를 돌려 job 유실이나 중복이 없는지 확인한다. */
 static void run_multi_producer_consumer_case(int producer_count, int consumer_count,
     int jobs_per_producer, size_t capacity)
 {
@@ -352,19 +352,19 @@ static void run_multi_producer_consumer_case(int producer_count, int consumer_co
     queue_destroy(queue);
 }
 
-/* Verify a modest concurrent workload completes without loss or duplication. */
+/* 비교적 작은 동시성 workload에서 유실/중복이 없는지 확인한다. */
 static void test_multiple_producers_multiple_consumers(void)
 {
     run_multi_producer_consumer_case(4, 4, 250, 32);
 }
 
-/* Stress the queue with a larger concurrent workload. */
+/* 더 큰 동시성 workload로 큐를 스트레스 테스트한다. */
 static void test_stress_queue(void)
 {
     run_multi_producer_consumer_case(4, 4, 2500, 64);
 }
 
-/* Run the full Part 4 queue test suite. */
+/* Part 4 큐 테스트 전체를 실행한다. */
 int main(void)
 {
     test_single_producer_single_consumer();

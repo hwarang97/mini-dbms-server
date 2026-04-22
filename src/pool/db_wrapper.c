@@ -1,105 +1,385 @@
-/*
- * db_wrapper.c — DB 엔진 래퍼
- *
- * 이 파일이 하는 일:
- *   SQL 문자열을 받아서 DB 엔진에 실행하고, 결과를 JSON 문자열로 반환한다.
- *
- * 현재 상태 (스텁):
- *   실제 DB 엔진(external/db_engine) 연결은 통합 단계에서 팀 전체가 함께 한다.
- *   지금은 받은 SQL을 그대로 JSON에 담아서 반환하는 스텁으로 구현되어 있다.
- *
- *   예) sql = "SELECT * FROM users"
- *       반환 → {"status":"ok","query":"SELECT * FROM users"}
- *
- * 통합 단계에서 교체할 부분:
- *   execute_query_safe() 내부에서 sql_processor_run_string() 또는
- *   execute() 를 호출해 실제 결과를 JSON으로 변환하면 된다.
- */
-
 #define _POSIX_C_SOURCE 200809L
 
 #include "db_wrapper.h"
 
+#include <ctype.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
-/*
- * execute_query_safe — SQL을 실행하고 결과를 JSON 문자열로 반환한다.
- *
- * 파라미터:
- *   sql      : 실행할 SQL 문자열. process_job이 넘겨줌.
- *   out_json : 결과 JSON 문자열을 저장할 포인터.
- *              이 함수 안에서 malloc하고, caller(process_job)가 free 책임.
- *
- * 반환값: 성공 0, 실패 -1
- *
- * 현재 동작 (스텁):
- *   SQL을 실제로 실행하지 않고, SQL 문자열을 JSON에 담아서 그대로 반환한다.
- *   JSON 형태: {"status":"ok","query":"<sql>"}
- *
- *   SQL 안에 큰따옴표(")나 백슬래시(\)가 있으면 JSON 규칙상 앞에 \를 붙여야 한다.
- *   예) sql = 'SELECT "name"'
- *       JSON → {"status":"ok","query":"SELECT \"name\""}
- */
+#include "cJSON.h"
+#include "types.h"
+
+static pthread_mutex_t g_db_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void free_string_array(char **items, int count)
+{
+    int index;
+
+    if (items == NULL) {
+        return;
+    }
+
+    for (index = 0; index < count; ++index) {
+        free(items[index]);
+    }
+
+    free(items);
+}
+
+static char *duplicate_range(const char *start, size_t length)
+{
+    char *copy = (char *)malloc(length + 1U);
+
+    if (copy == NULL) {
+        return NULL;
+    }
+
+    memcpy(copy, start, length);
+    copy[length] = '\0';
+    return copy;
+}
+
+static char *trim_in_place(char *text)
+{
+    char *start = text;
+    char *end;
+
+    while (*start != '\0' && isspace((unsigned char)*start)) {
+        ++start;
+    }
+
+    end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) {
+        --end;
+    }
+
+    *end = '\0';
+    return start;
+}
+
+static const char *find_keyword_case_insensitive(const char *text, const char *keyword)
+{
+    size_t keyword_length = strlen(keyword);
+    const char *cursor = text;
+
+    while (*cursor != '\0') {
+        if ((cursor == text || isspace((unsigned char)cursor[-1])) &&
+            strncasecmp(cursor, keyword, keyword_length) == 0 &&
+            (cursor[keyword_length] == '\0' ||
+             isspace((unsigned char)cursor[keyword_length]) ||
+             cursor[keyword_length] == '(')) {
+            return cursor;
+        }
+
+        ++cursor;
+    }
+
+    return NULL;
+}
+
+static int load_schema_columns(const char *table, char ***out_columns, int *out_count)
+{
+    char schema_path[256];
+    FILE *schema_file = NULL;
+    char line[256];
+    char **columns = NULL;
+    int count = 0;
+    int capacity = 0;
+    int written;
+
+    if (table == NULL || out_columns == NULL || out_count == NULL) {
+        return -1;
+    }
+
+    written = snprintf(schema_path, sizeof(schema_path), "data/schema/%s.schema", table);
+    if (written < 0 || (size_t)written >= sizeof(schema_path)) {
+        return -1;
+    }
+
+    schema_file = fopen(schema_path, "r");
+    if (schema_file == NULL) {
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), schema_file) != NULL) {
+        char *comma = strchr(line, ',');
+        char *column_name;
+        char **grown_columns;
+
+        if (comma == NULL) {
+            free_string_array(columns, count);
+            fclose(schema_file);
+            return -1;
+        }
+
+        *comma = '\0';
+        column_name = trim_in_place(line);
+        if (*column_name == '\0') {
+            continue;
+        }
+
+        if (count == capacity) {
+            int new_capacity = (capacity == 0) ? 4 : capacity * 2;
+
+            grown_columns = (char **)realloc(columns,
+                                             (size_t)new_capacity * sizeof(*columns));
+            if (grown_columns == NULL) {
+                free_string_array(columns, count);
+                fclose(schema_file);
+                return -1;
+            }
+
+            columns = grown_columns;
+            capacity = new_capacity;
+        }
+
+        columns[count] = duplicate_range(column_name, strlen(column_name));
+        if (columns[count] == NULL) {
+            free_string_array(columns, count);
+            fclose(schema_file);
+            return -1;
+        }
+
+        ++count;
+    }
+
+    fclose(schema_file);
+    *out_columns = columns;
+    *out_count = count;
+    return 0;
+}
+
+static int build_insert_with_schema_columns(const char *original_sql,
+                                           const char *table,
+                                           char **out_rewritten_sql)
+{
+    const char *values_keyword;
+    char **columns = NULL;
+    int column_count = 0;
+    size_t rewritten_length;
+    size_t offset = 0;
+    int index;
+    char *rewritten_sql;
+
+    if (original_sql == NULL || table == NULL || out_rewritten_sql == NULL) {
+        return -1;
+    }
+
+    values_keyword = find_keyword_case_insensitive(original_sql, "VALUES");
+    if (values_keyword == NULL) {
+        return -1;
+    }
+
+    if (load_schema_columns(table, &columns, &column_count) != 0 || column_count == 0) {
+        free_string_array(columns, column_count);
+        return -1;
+    }
+
+    rewritten_length = strlen("INSERT INTO ") + strlen(table) + strlen(" () ") +
+                       strlen(values_keyword);
+    for (index = 0; index < column_count; ++index) {
+        rewritten_length += strlen(columns[index]);
+        if (index + 1 < column_count) {
+            rewritten_length += 2U;
+        }
+    }
+
+    rewritten_sql = (char *)malloc(rewritten_length + 1U);
+    if (rewritten_sql == NULL) {
+        free_string_array(columns, column_count);
+        return -1;
+    }
+
+    offset += (size_t)snprintf(rewritten_sql + offset, rewritten_length + 1U - offset,
+                               "INSERT INTO %s (", table);
+    for (index = 0; index < column_count; ++index) {
+        offset += (size_t)snprintf(rewritten_sql + offset, rewritten_length + 1U - offset,
+                                   "%s%s", columns[index],
+                                   (index + 1 < column_count) ? ", " : "");
+    }
+    (void)snprintf(rewritten_sql + offset, rewritten_length + 1U - offset,
+                   ") %s", values_keyword);
+
+    free_string_array(columns, column_count);
+    *out_rewritten_sql = rewritten_sql;
+    return 0;
+}
+
+static ParsedSQL *parse_sql_with_insert_fallback(const char *sql, char **rewritten_sql)
+{
+    ParsedSQL *parsed = parse_sql(sql);
+
+    if (parsed == NULL) {
+        return NULL;
+    }
+
+    if (parsed->type == QUERY_INSERT &&
+        (parsed->columns == NULL || parsed->col_count == 0 ||
+         parsed->values == NULL || parsed->val_count == 0) &&
+        build_insert_with_schema_columns(sql, parsed->table, rewritten_sql) == 0) {
+        free_parsed(parsed);
+        parsed = parse_sql(*rewritten_sql);
+    }
+
+    return parsed;
+}
+
+static int build_simple_ok_json(char **out_json)
+{
+    cJSON *root = cJSON_CreateObject();
+
+    if (root == NULL) {
+        return -1;
+    }
+
+    if (cJSON_AddStringToObject(root, "status", "ok") == NULL) {
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    *out_json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return (*out_json != NULL) ? 0 : -1;
+}
+
+static int build_select_json(const RowSet *rowset, char **out_json)
+{
+    cJSON *root = NULL;
+    cJSON *rows = NULL;
+    int row_index;
+
+    if (rowset == NULL || out_json == NULL) {
+        return -1;
+    }
+
+    root = cJSON_CreateObject();
+    if (root == NULL) {
+        return -1;
+    }
+
+    if (cJSON_AddStringToObject(root, "status", "ok") == NULL ||
+        cJSON_AddNumberToObject(root, "count", rowset->row_count) == NULL) {
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    rows = cJSON_AddArrayToObject(root, "rows");
+    if (rows == NULL) {
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    for (row_index = 0; row_index < rowset->row_count; ++row_index) {
+        cJSON *row_object = cJSON_CreateObject();
+        int column_index;
+
+        if (row_object == NULL) {
+            cJSON_Delete(root);
+            return -1;
+        }
+
+        for (column_index = 0; column_index < rowset->col_count; ++column_index) {
+            const char *column_name = rowset->col_names[column_index];
+            const char *value = rowset->rows[row_index][column_index];
+
+            if (cJSON_AddStringToObject(row_object,
+                                        (column_name != NULL) ? column_name : "",
+                                        (value != NULL) ? value : "") == NULL) {
+                cJSON_Delete(row_object);
+                cJSON_Delete(root);
+                return -1;
+            }
+        }
+
+        cJSON_AddItemToArray(rows, row_object);
+    }
+
+    *out_json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return (*out_json != NULL) ? 0 : -1;
+}
+
+static int execute_parsed_sql(ParsedSQL *parsed_sql, char **out_json)
+{
+    RowSet *rowset = NULL;
+    int status = -1;
+
+    switch (parsed_sql->type) {
+    case QUERY_SELECT:
+        if (storage_select_result(parsed_sql->table, parsed_sql, &rowset) == 0) {
+            status = build_select_json(rowset, out_json);
+        }
+        break;
+
+    case QUERY_CREATE:
+        if (storage_create(parsed_sql->table, parsed_sql->col_defs,
+                           parsed_sql->col_def_count) == 0) {
+            status = build_simple_ok_json(out_json);
+        }
+        break;
+
+    case QUERY_INSERT:
+        if (storage_insert(parsed_sql->table, parsed_sql->columns,
+                           parsed_sql->values, parsed_sql->val_count) == 0) {
+            status = build_simple_ok_json(out_json);
+        }
+        break;
+
+    case QUERY_DELETE:
+        if (storage_delete(parsed_sql->table, parsed_sql) == 0) {
+            status = build_simple_ok_json(out_json);
+        }
+        break;
+
+    case QUERY_UPDATE:
+        if (storage_update(parsed_sql->table, parsed_sql) == 0) {
+            status = build_simple_ok_json(out_json);
+        }
+        break;
+
+    case QUERY_UNKNOWN:
+    default:
+        status = -1;
+        break;
+    }
+
+    rowset_free(rowset);
+    return status;
+}
+
 int execute_query_safe(const char *sql, char **out_json)
 {
-    char *json;
-    size_t sql_len;
-    size_t json_len;
-    size_t i;
-    size_t j;
-    char *escaped;
+    ParsedSQL *parsed_sql = NULL;
+    char *rewritten_sql = NULL;
+    int status = -1;
 
     if (sql == NULL || out_json == NULL) {
         return -1;
     }
 
-    sql_len = strlen(sql);
+    *out_json = NULL;
 
-    /*
-     * 이스케이프 처리를 위한 임시 버퍼 할당.
-     *
-     * JSON 문자열 안에서 " 와 \ 는 특수문자라서 앞에 \ 를 붙여야 한다.
-     * 최악의 경우 모든 글자가 이스케이프되므로 sql_len * 2 + 1 만큼 확보.
-     * (예: "aaa" → \"aaa\" 로 길이가 2배가 될 수 있음)
-     *
-     * 이 버퍼는 이 함수 안에서만 사용하고 아래에서 해제한다.
-     */
-    escaped = (char *)malloc(sql_len * 2 + 1); /* this func frees */
-    if (escaped == NULL) {
-        return -1;
+    pthread_mutex_lock(&g_db_mutex);
+
+    parsed_sql = parse_sql_with_insert_fallback(sql, &rewritten_sql);
+    if (parsed_sql == NULL || parsed_sql->type == QUERY_UNKNOWN) {
+        goto cleanup;
     }
 
-    /* SQL을 한 글자씩 읽으면서 " 와 \ 앞에 \ 삽입 */
-    for (i = 0, j = 0; i < sql_len; i++) {
-        if (sql[i] == '"' || sql[i] == '\\') {
-            escaped[j++] = '\\'; /* 이스케이프 문자 삽입 */
-        }
-        escaped[j++] = sql[i];  /* 원래 글자 복사 */
-    }
-    escaped[j] = '\0'; /* 문자열 끝 표시 */
+    status = execute_parsed_sql(parsed_sql, out_json);
 
-    /*
-     * 최종 JSON 문자열 버퍼 할당.
-     *
-     * {"status":"ok","query":"<escaped_sql>"} 형태로 만든다.
-     * j = 이스케이프된 sql 길이, 32 = 나머지 고정 문자열 길이 여유분.
-     *
-     * caller(process_job)가 free 책임.
-     */
-    json_len = j + 32;
-    json = (char *)malloc(json_len + strlen("{\"status\":\"ok\",\"query\":\"\"}"));
-    if (json == NULL) {
-        free(escaped);
-        return -1;
+cleanup:
+    free_parsed(parsed_sql);
+    free(rewritten_sql);
+    pthread_mutex_unlock(&g_db_mutex);
+
+    if (status != 0) {
+        free(*out_json);
+        *out_json = NULL;
     }
 
-    /* JSON 문자열 완성 */
-    snprintf(json, json_len + 32, "{\"status\":\"ok\",\"query\":\"%s\"}", escaped);
-
-    free(escaped); /* 임시 이스케이프 버퍼 해제 */
-
-    *out_json = json; /* caller frees */
-    return 0;
+    return status;
 }

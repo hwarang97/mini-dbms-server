@@ -1,5 +1,6 @@
 #include "http.h"
 
+#include <dirent.h>
 #include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
@@ -20,6 +21,7 @@
 enum {
     HTTP_BAD_REQUEST = 400,
     HTTP_NOT_FOUND = 404,
+    HTTP_METHOD_NOT_ALLOWED = 405,
     HTTP_PAYLOAD_TOO_LARGE = 413,
     HTTP_INTERNAL_SERVER_ERROR = 500
 };
@@ -67,6 +69,8 @@ static const char *reason_phrase_for_status(int status_code)
     switch (status_code) {
     case HTTP_NOT_FOUND:
         return "Not Found";
+    case HTTP_METHOD_NOT_ALLOWED:
+        return "Method Not Allowed";
     case HTTP_PAYLOAD_TOO_LARGE:
         return "Payload Too Large";
     case HTTP_INTERNAL_SERVER_ERROR:
@@ -82,6 +86,8 @@ static const char *error_body_for_status(int status_code)
     switch (status_code) {
     case HTTP_NOT_FOUND:
         return "{\"error\":\"not found\"}";
+    case HTTP_METHOD_NOT_ALLOWED:
+        return "{\"error\":\"method not allowed\"}";
     case HTTP_PAYLOAD_TOO_LARGE:
         return "{\"error\":\"payload too large\"}";
     case HTTP_INTERNAL_SERVER_ERROR:
@@ -117,6 +123,71 @@ static void send_error_and_close(int client_fd, int status_code)
     send_response(client_fd, status_code, reason_phrase_for_status(status_code),
                   error_body_for_status(status_code));
     (void)close(client_fd);
+}
+
+static int has_suffix(const char *text, const char *suffix)
+{
+    size_t text_length = strlen(text);
+    size_t suffix_length = strlen(suffix);
+
+    if (text_length < suffix_length) {
+        return 0;
+    }
+
+    return strcmp(text + text_length - suffix_length, suffix) == 0;
+}
+
+static char *build_tables_response_body(void)
+{
+    DIR *directory = NULL;
+    struct dirent *entry;
+    cJSON *tables = cJSON_CreateArray();
+    char *body = NULL;
+
+    if (tables == NULL) {
+        return NULL;
+    }
+
+    directory = opendir("data/schema");
+    if (directory == NULL) {
+        body = cJSON_PrintUnformatted(tables);
+        cJSON_Delete(tables);
+        return body;
+    }
+
+    while ((entry = readdir(directory)) != NULL) {
+        size_t table_name_length;
+        char *table_name;
+
+        if (entry->d_name[0] == '.' || !has_suffix(entry->d_name, ".schema")) {
+            continue;
+        }
+
+        table_name_length = strlen(entry->d_name) - strlen(".schema");
+        table_name = (char *)malloc(table_name_length + 1U);
+        if (table_name == NULL) {
+            closedir(directory);
+            cJSON_Delete(tables);
+            return NULL;
+        }
+
+        memcpy(table_name, entry->d_name, table_name_length);
+        table_name[table_name_length] = '\0';
+
+        if (cJSON_AddItemToArray(tables, cJSON_CreateString(table_name)) == 0) {
+            free(table_name);
+            closedir(directory);
+            cJSON_Delete(tables);
+            return NULL;
+        }
+
+        free(table_name);
+    }
+
+    closedir(directory);
+    body = cJSON_PrintUnformatted(tables);
+    cJSON_Delete(tables);
+    return body;
 }
 
 static size_t find_double_crlf(const char *buffer, size_t length)
@@ -225,7 +296,7 @@ static int extract_content_length(const char *buffer, size_t header_end, size_t 
             ++line_end;
         }
 
-        if (line_end >= headers_end || line_end + 1 >= headers_end || line_end[1] != '\n') {
+        if (line_end > headers_end || line_end[1] != '\n') {
             return HTTP_BAD_REQUEST;
         }
 
@@ -261,9 +332,8 @@ static int extract_content_length(const char *buffer, size_t header_end, size_t 
     }
 
     if (!saw_content_length) {
-        return HTTP_BAD_REQUEST;
+        *out_length = 0;
     }
-
     return 0;
 }
 
@@ -425,15 +495,6 @@ static int validate_http_version(const char *version)
     return 0;
 }
 
-static int validate_query_route(const char *method, const char *path)
-{
-    if (strcmp(method, "POST") != 0 || strcmp(path, "/query") != 0) {
-        return HTTP_NOT_FOUND;
-    }
-
-    return 0;
-}
-
 static int parse_http_request(raw_http_request_t *raw_request, parsed_http_request_t *parsed_request)
 {
     char *request_line_end = strstr(raw_request->buffer, "\r\n");
@@ -453,11 +514,6 @@ static int parse_http_request(raw_http_request_t *raw_request, parsed_http_reque
     }
 
     status = validate_http_version(parsed_request->version);
-    if (status != 0) {
-        return status;
-    }
-
-    status = validate_query_route(parsed_request->method, parsed_request->path);
     if (status != 0) {
         return status;
     }
@@ -486,6 +542,11 @@ static int extract_sql_from_body(const parsed_http_request_t *request, char **sq
     }
 
     sql_length = strlen(sql_item->valuestring);
+    if (sql_length == 0U) {
+        cJSON_Delete(payload);
+        return HTTP_BAD_REQUEST;
+    }
+
     *sql_copy = (char *)malloc(sql_length + 1U);
     if (*sql_copy == NULL) {
         cJSON_Delete(payload);
@@ -494,6 +555,41 @@ static int extract_sql_from_body(const parsed_http_request_t *request, char **sq
 
     memcpy(*sql_copy, sql_item->valuestring, sql_length + 1U);
     cJSON_Delete(payload);
+    return 0;
+}
+
+static int handle_non_query_request(int client_fd, const parsed_http_request_t *request)
+{
+    if (strcmp(request->method, "GET") == 0 && strcmp(request->path, "/health") == 0) {
+        send_response(client_fd, 200, "OK", "{\"status\":\"ok\"}");
+        (void)close(client_fd);
+        return 1;
+    }
+
+    if (strcmp(request->method, "GET") == 0 && strcmp(request->path, "/tables") == 0) {
+        char *body = build_tables_response_body();
+
+        if (body == NULL) {
+            send_error_and_close(client_fd, HTTP_INTERNAL_SERVER_ERROR);
+            return 1;
+        }
+
+        send_response(client_fd, 200, "OK", body);
+        free(body);
+        (void)close(client_fd);
+        return 1;
+    }
+
+    if (strcmp(request->path, "/query") == 0 && strcmp(request->method, "POST") != 0) {
+        send_error_and_close(client_fd, HTTP_METHOD_NOT_ALLOWED);
+        return 1;
+    }
+
+    if (strcmp(request->method, "POST") != 0 || strcmp(request->path, "/query") != 0) {
+        send_error_and_close(client_fd, HTTP_NOT_FOUND);
+        return 1;
+    }
+
     return 0;
 }
 
@@ -548,6 +644,11 @@ void handle_connection(int client_fd)
     status = parse_http_request(&raw_request, &parsed_request);
     if (status != 0) {
         goto cleanup;
+    }
+
+    if (handle_non_query_request(client_fd, &parsed_request)) {
+        free(raw_request.buffer);
+        return;
     }
 
     status = extract_sql_from_body(&parsed_request, &sql_copy);

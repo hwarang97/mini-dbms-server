@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 
+/* Fixed-capacity ring buffer guarded by one mutex and two condition variables. */
 struct job_queue {
     job_t **buffer;
     size_t capacity;
@@ -17,6 +18,7 @@ struct job_queue {
 
 job_queue_t *g_queue = NULL;
 
+/* Allocate queue storage and initialize synchronization primitives. */
 job_queue_t *queue_init(size_t capacity)
 {
     job_queue_t *q;
@@ -66,6 +68,7 @@ job_queue_t *queue_init(size_t capacity)
     return q;
 }
 
+/* Block while the queue is full, unless shutdown has started. */
 int queue_push(job_queue_t *q, job_t *job)
 {
     if (q == NULL || job == NULL) {
@@ -92,6 +95,7 @@ int queue_push(job_queue_t *q, job_t *job)
     return 0;
 }
 
+/* Block while the queue is empty, and return NULL only after shutdown drains it. */
 job_t *queue_pop(job_queue_t *q)
 {
     job_t *job;
@@ -121,6 +125,7 @@ job_t *queue_pop(job_queue_t *q)
     return job;
 }
 
+/* Wake every blocked producer and consumer so they can observe shutdown. */
 void queue_shutdown(job_queue_t *q)
 {
     if (q == NULL) {
@@ -134,6 +139,7 @@ void queue_shutdown(job_queue_t *q)
     pthread_mutex_unlock(&q->mutex);
 }
 
+/* Release queue-owned memory after all producers and consumers have stopped. */
 void queue_destroy(job_queue_t *q)
 {
     if (q == NULL) {

@@ -6,12 +6,14 @@
 
 #include "job_queue.h"
 
+/* Small barrier used to confirm worker threads are blocked before shutdown. */
 typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     int count;
 } start_latch_t;
 
+/* Producer configuration for pushing a contiguous slice of jobs. */
 typedef struct {
     job_queue_t *queue;
     job_t *jobs;
@@ -19,12 +21,14 @@ typedef struct {
     int count;
 } producer_args_t;
 
+/* Consumer configuration for preserving observed dequeue order. */
 typedef struct {
     job_queue_t *queue;
     int *output;
     int count;
 } ordered_consumer_args_t;
 
+/* Consumer configuration for counting every consumed job exactly once. */
 typedef struct {
     job_queue_t *queue;
     int *seen;
@@ -32,12 +36,14 @@ typedef struct {
     pthread_mutex_t *seen_mutex;
 } counting_consumer_args_t;
 
+/* Thread arguments for poppers that should wake up on shutdown. */
 typedef struct {
     job_queue_t *queue;
     start_latch_t *latch;
     job_t *result;
 } pop_waiter_args_t;
 
+/* Thread arguments for pushers that should fail once shutdown starts. */
 typedef struct {
     job_queue_t *queue;
     start_latch_t *latch;
@@ -45,6 +51,7 @@ typedef struct {
     int rc;
 } push_waiter_args_t;
 
+/* Initialize the latch used by blocking wakeup tests. */
 static void start_latch_init(start_latch_t *latch)
 {
     assert(pthread_mutex_init(&latch->mutex, NULL) == 0);
@@ -52,12 +59,14 @@ static void start_latch_init(start_latch_t *latch)
     latch->count = 0;
 }
 
+/* Release latch resources after the waiting test completes. */
 static void start_latch_destroy(start_latch_t *latch)
 {
     assert(pthread_cond_destroy(&latch->cond) == 0);
     assert(pthread_mutex_destroy(&latch->mutex) == 0);
 }
 
+/* Record that a waiter has reached its blocking point. */
 static void start_latch_signal(start_latch_t *latch)
 {
     assert(pthread_mutex_lock(&latch->mutex) == 0);
@@ -66,6 +75,7 @@ static void start_latch_signal(start_latch_t *latch)
     assert(pthread_mutex_unlock(&latch->mutex) == 0);
 }
 
+/* Wait until every helper thread is ready for the shutdown trigger. */
 static void start_latch_wait_for(start_latch_t *latch, int target)
 {
     assert(pthread_mutex_lock(&latch->mutex) == 0);
@@ -75,6 +85,7 @@ static void start_latch_wait_for(start_latch_t *latch, int target)
     assert(pthread_mutex_unlock(&latch->mutex) == 0);
 }
 
+/* Push a fixed batch of jobs into the shared queue. */
 static void *producer_thread(void *arg)
 {
     producer_args_t *args = (producer_args_t *)arg;
@@ -87,6 +98,7 @@ static void *producer_thread(void *arg)
     return NULL;
 }
 
+/* Pop a fixed batch of jobs and record their dequeue order. */
 static void *ordered_consumer_thread(void *arg)
 {
     ordered_consumer_args_t *args = (ordered_consumer_args_t *)arg;
@@ -101,6 +113,7 @@ static void *ordered_consumer_thread(void *arg)
     return NULL;
 }
 
+/* Consume until shutdown, counting each observed job id once. */
 static void *counting_consumer_thread(void *arg)
 {
     counting_consumer_args_t *args = (counting_consumer_args_t *)arg;
@@ -121,6 +134,7 @@ static void *counting_consumer_thread(void *arg)
     return NULL;
 }
 
+/* Block on pop so shutdown behavior can be asserted. */
 static void *pop_waiter_thread(void *arg)
 {
     pop_waiter_args_t *args = (pop_waiter_args_t *)arg;
@@ -130,6 +144,7 @@ static void *pop_waiter_thread(void *arg)
     return NULL;
 }
 
+/* Block on push so shutdown behavior can be asserted. */
 static void *push_waiter_thread(void *arg)
 {
     push_waiter_args_t *args = (push_waiter_args_t *)arg;
@@ -139,6 +154,7 @@ static void *push_waiter_thread(void *arg)
     return NULL;
 }
 
+/* Verify FIFO order with one producer and one consumer. */
 static void test_single_producer_single_consumer(void)
 {
     enum { job_count = 128 };
@@ -181,6 +197,7 @@ static void test_single_producer_single_consumer(void)
     queue_destroy(queue);
 }
 
+/* Verify shutdown wakes all consumers blocked on an empty queue. */
 static void test_shutdown_wakes_blocked_poppers(void)
 {
     enum { waiter_count = 4 };
@@ -212,6 +229,7 @@ static void test_shutdown_wakes_blocked_poppers(void)
     queue_destroy(queue);
 }
 
+/* Verify shutdown wakes all producers blocked on a full queue. */
 static void test_shutdown_wakes_blocked_pushers(void)
 {
     enum { waiter_count = 4 };
@@ -255,6 +273,7 @@ static void test_shutdown_wakes_blocked_pushers(void)
     queue_destroy(queue);
 }
 
+/* Run a shared multi-threaded workload and check for loss or duplication. */
 static void run_multi_producer_consumer_case(int producer_count, int consumer_count,
     int jobs_per_producer, size_t capacity)
 {
@@ -333,16 +352,19 @@ static void run_multi_producer_consumer_case(int producer_count, int consumer_co
     queue_destroy(queue);
 }
 
+/* Verify a modest concurrent workload completes without loss or duplication. */
 static void test_multiple_producers_multiple_consumers(void)
 {
     run_multi_producer_consumer_case(4, 4, 250, 32);
 }
 
+/* Stress the queue with a larger concurrent workload. */
 static void test_stress_queue(void)
 {
     run_multi_producer_consumer_case(4, 4, 2500, 64);
 }
 
+/* Run the full Part 4 queue test suite. */
 int main(void)
 {
     test_single_producer_single_consumer();

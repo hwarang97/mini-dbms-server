@@ -26,13 +26,28 @@ SERVER_OBJECTS = $(PROJECT_SOURCES:%.c=obj/%.o) $(CJSON_SOURCES:%.c=obj/%.o) $(D
 TEST_SUPPORT_OBJECTS = $(filter-out obj/src/main.o,$(SERVER_OBJECTS))
 TEST_SOURCES = tests/test_server.c tests/test_http.c tests/test_pool.c tests/test_queue.c
 TEST_BINS = $(TEST_SOURCES:tests/%.c=bin/%)
+RESOURCE_CHECK_SCRIPTS = \
+	scripts/check_leaks.sh \
+	scripts/check_races.sh \
+	scripts/check_fd.sh
 
-.PHONY: all clean test
+.PHONY: all clean test check-leaks check-races check-fd check-resources
 
 all: bin/dbms_server
 
 test: $(TEST_BINS)
 	@set -e; for test_bin in $(TEST_BINS); do ./$$test_bin; done
+
+check-leaks: bin/dbms_server $(RESOURCE_CHECK_SCRIPTS)
+	bash scripts/check_leaks.sh
+
+check-races: bin/dbms_server $(RESOURCE_CHECK_SCRIPTS)
+	bash scripts/check_races.sh
+
+check-fd: bin/dbms_server $(RESOURCE_CHECK_SCRIPTS)
+	bash scripts/check_fd.sh
+
+check-resources: check-leaks check-races check-fd
 
 bin/dbms_server: $(SERVER_OBJECTS)
 	@mkdir -p $(@D)

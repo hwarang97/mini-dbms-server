@@ -92,6 +92,7 @@ make
 
 ```bash
 make test
+make check-resources
 ```
 
 ---

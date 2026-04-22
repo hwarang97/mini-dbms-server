@@ -206,6 +206,7 @@ static char *run_job_and_collect_response(const char *sql)
     job->sql = duplicate_string(sql); /* worker frees after process_job */
 
     pool_set_queue_hooks_for_test(NULL, NULL);
+    pool_set_query_executor_for_test(NULL);
 
     assert(pool_init(1, queue) == 0);
     assert(queue_push(queue, job) == 0);

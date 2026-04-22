@@ -29,7 +29,7 @@ TEST_BINS = $(TEST_SOURCES:tests/%.c=bin/%)
 
 .PHONY: all clean test
 
-all: bin/dbms_serve
+all: bin/dbms_server
 
 test: $(TEST_BINS)
 	@set -e; for test_bin in $(TEST_BINS); do ./$$test_bin; done

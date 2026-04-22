@@ -1,0 +1,23 @@
+# Build artifacts
+bin/
+obj/
+*.o
+*.a
+*.so
+*.dSYM/
+
+# Edito
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Test output
+test-results/
+*.log
+core
+core.*
+
+# Codex / Claude
+.codex/
+.claude/

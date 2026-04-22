@@ -34,6 +34,7 @@
  */
 typedef job_t *(*queue_pop_fn_t)(job_queue_t *queue);
 typedef void (*queue_shutdown_fn_t)(job_queue_t *queue);
+typedef int (*query_execute_fn_t)(const char *sql, char **out_json);
 
 /*
  * 전역 상태 변수.
@@ -48,6 +49,7 @@ static size_t               g_worker_count     = 0;
 static job_queue_t         *g_pool_queue       = NULL;
 static queue_pop_fn_t       g_queue_pop_fn     = queue_pop;
 static queue_shutdown_fn_t  g_queue_shutdown_fn = queue_shutdown;
+static query_execute_fn_t   g_query_execute_fn = execute_query_safe;
 
 /*
  * write_http_response — HTTP 200 OK 응답을 소켓(fd)에 쓴다.
@@ -144,7 +146,7 @@ static void process_job(job_t *job)
 
     /* SQL을 실행하고 결과를 JSON 문자열로 받는다.
      * 성공 시 json에 malloc된 문자열이 들어온다. */
-    if (execute_query_safe(job->sql, &json) == 0 && json != NULL) {
+    if (g_query_execute_fn(job->sql, &json) == 0 && json != NULL) {
         write_http_response(job->client_fd, json);
         free(json); /* execute_query_safe가 malloc한 것을 여기서 해제 */
     } else {
@@ -310,4 +312,9 @@ void pool_set_queue_hooks_for_test(job_t *(*pop_fn)(job_queue_t *),
 {
     g_queue_pop_fn     = (pop_fn      != NULL) ? pop_fn      : queue_pop;
     g_queue_shutdown_fn = (shutdown_fn != NULL) ? shutdown_fn : queue_shutdown;
+}
+
+void pool_set_query_executor_for_test(int (*executor_fn)(const char *sql, char **out_json))
+{
+    g_query_execute_fn = (executor_fn != NULL) ? executor_fn : execute_query_safe;
 }

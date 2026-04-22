@@ -11,6 +11,7 @@
 
 void pool_set_queue_hooks_for_test(job_t *(*pop_fn)(job_queue_t *),
                                    void (*shutdown_fn)(job_queue_t *));
+void pool_set_query_executor_for_test(int (*executor_fn)(const char *sql, char **out_json));
 
 #define TEST_JOB_COUNT 24
 #define TEST_WORKER_COUNT 4
@@ -31,6 +32,19 @@ static size_t mock_next_job = 0;
 static int mock_shutdown_seen = 0;
 static unsigned int mock_shutdown_calls = 0;
 static int fake_queue_token = 0;
+
+static int mock_execute_query(const char *sql, char **out_json)
+{
+    const char *body = "{\"status\":\"ok\"}";
+    size_t len = strlen(body) + 1U;
+
+    (void)sql;
+
+    *out_json = (char *)malloc(len);
+    assert(*out_json != NULL);
+    memcpy(*out_json, body, len);
+    return 0;
+}
 
 static char *duplicate_string(const char *value)
 {
@@ -233,6 +247,7 @@ static void test_workers_process_jobs(void)
     reset_mock(MOCK_DRAIN_JOBS);
     prepare_jobs(TEST_JOB_COUNT);
     pool_set_queue_hooks_for_test(mock_queue_pop, mock_queue_shutdown);
+    pool_set_query_executor_for_test(mock_execute_query);
 
     assert(pool_init(TEST_WORKER_COUNT, fake_queue) == 0);
     pool_shutdown();
@@ -278,6 +293,7 @@ static void test_shutdown_joins_idle_workers(void)
 
     reset_mock(MOCK_BLOCK_UNTIL_SHUTDOWN);
     pool_set_queue_hooks_for_test(mock_queue_pop, mock_queue_shutdown);
+    pool_set_query_executor_for_test(mock_execute_query);
 
     assert(pool_init(TEST_WORKER_COUNT, fake_queue) == 0);
     pool_shutdown();
@@ -295,6 +311,7 @@ int main(void)
     test_worker_writes_error_response_on_query_failure();
     test_shutdown_joins_idle_workers();
     pool_set_queue_hooks_for_test(NULL, NULL);
+    pool_set_query_executor_for_test(NULL);
 
     printf("test_pool passed\n");
     return 0;

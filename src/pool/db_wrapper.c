@@ -14,6 +14,10 @@
 
 static pthread_mutex_t g_db_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static int build_insert_with_schema_columns(const char *original_sql,
+                                           const char *table,
+                                           char **out_rewritten_sql);
+
 static void free_string_array(char **items, int count)
 {
     int index;
@@ -60,6 +64,15 @@ static char *trim_in_place(char *text)
     return start;
 }
 
+static const char *skip_spaces(const char *text)
+{
+    while (*text != '\0' && isspace((unsigned char)*text)) {
+        ++text;
+    }
+
+    return text;
+}
+
 static const char *find_keyword_case_insensitive(const char *text, const char *keyword)
 {
     size_t keyword_length = strlen(keyword);
@@ -78,6 +91,79 @@ static const char *find_keyword_case_insensitive(const char *text, const char *k
     }
 
     return NULL;
+}
+
+static int consume_keyword(const char **cursor, const char *keyword)
+{
+    size_t keyword_length = strlen(keyword);
+    const char *current = skip_spaces(*cursor);
+
+    if (strncasecmp(current, keyword, keyword_length) != 0) {
+        return 0;
+    }
+
+    if (current[keyword_length] != '\0' &&
+        !isspace((unsigned char)current[keyword_length]) &&
+        current[keyword_length] != '(') {
+        return 0;
+    }
+
+    *cursor = current + keyword_length;
+    return 1;
+}
+
+static int try_rewrite_insert_without_columns(const char *sql, char **out_rewritten_sql)
+{
+    const char *cursor = sql;
+    const char *table_start;
+    const char *table_end;
+    char *table_name;
+    int status;
+
+    if (sql == NULL || out_rewritten_sql == NULL) {
+        return -1;
+    }
+
+    *out_rewritten_sql = NULL;
+
+    if (!consume_keyword(&cursor, "INSERT")) {
+        return -1;
+    }
+
+    if (!consume_keyword(&cursor, "INTO")) {
+        return -1;
+    }
+
+    cursor = skip_spaces(cursor);
+    table_start = cursor;
+    while (*cursor != '\0' &&
+           !isspace((unsigned char)*cursor) &&
+           *cursor != '(') {
+        ++cursor;
+    }
+    table_end = cursor;
+
+    if (table_end == table_start) {
+        return -1;
+    }
+
+    cursor = skip_spaces(cursor);
+    if (*cursor == '(') {
+        return -1;
+    }
+
+    if (!consume_keyword(&cursor, "VALUES")) {
+        return -1;
+    }
+
+    table_name = duplicate_range(table_start, (size_t)(table_end - table_start));
+    if (table_name == NULL) {
+        return -1;
+    }
+
+    status = build_insert_with_schema_columns(sql, table_name, out_rewritten_sql);
+    free(table_name);
+    return status;
 }
 
 static int load_schema_columns(const char *table, char ***out_columns, int *out_count)
@@ -210,7 +296,13 @@ static int build_insert_with_schema_columns(const char *original_sql,
 
 static ParsedSQL *parse_sql_with_insert_fallback(const char *sql, char **rewritten_sql)
 {
-    ParsedSQL *parsed = parse_sql(sql);
+    ParsedSQL *parsed;
+
+    if (try_rewrite_insert_without_columns(sql, rewritten_sql) == 0) {
+        return parse_sql(*rewritten_sql);
+    }
+
+    parsed = parse_sql(sql);
 
     if (parsed == NULL) {
         return NULL;

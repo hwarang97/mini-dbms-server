@@ -1,7 +1,7 @@
 #include "server.h"
 
 #include <errno.h>
-#include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,14 +11,26 @@
 
 #include "http.h"
 
-static volatile sig_atomic_t g_stop_requested = 0;
-static int g_listen_fd = -1;
+static atomic_int g_stop_requested = ATOMIC_VAR_INIT(0);
+static atomic_int g_listen_fd = ATOMIC_VAR_INIT(-1);
+static void (*g_connection_handler)(int) = handle_connection;
 
 static void close_listen_socket(void)
 {
-    if (g_listen_fd >= 0) {
-        close(g_listen_fd);
-        g_listen_fd = -1;
+    int listen_fd = atomic_exchange(&g_listen_fd, -1);
+
+    if (listen_fd >= 0) {
+        close(listen_fd);
+    }
+}
+
+static void shutdown_listen_socket(void)
+{
+    int listen_fd = atomic_exchange(&g_listen_fd, -1);
+
+    if (listen_fd >= 0) {
+        shutdown(listen_fd, SHUT_RDWR);
+        close(listen_fd);
     }
 }
 
@@ -32,14 +44,14 @@ int server_start(int port)
         return -1;
     }
 
-    g_stop_requested = 0;
-    g_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (g_listen_fd < 0) {
+    atomic_store(&g_stop_requested, 0);
+    atomic_store(&g_listen_fd, socket(AF_INET, SOCK_STREAM, 0));
+    if (atomic_load(&g_listen_fd) < 0) {
         perror("socket");
         return -1;
     }
 
-    if (setsockopt(g_listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr,
+    if (setsockopt(atomic_load(&g_listen_fd), SOL_SOCKET, SO_REUSEADDR, &reuse_addr,
                    sizeof(reuse_addr)) < 0) {
         perror("setsockopt");
         close_listen_socket();
@@ -51,13 +63,14 @@ int server_start(int port)
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     server_addr.sin_port = htons((uint16_t)port);
 
-    if (bind(g_listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    if (bind(atomic_load(&g_listen_fd), (struct sockaddr *)&server_addr,
+             sizeof(server_addr)) < 0) {
         perror("bind");
         close_listen_socket();
         return -1;
     }
 
-    if (listen(g_listen_fd, SOMAXCONN) < 0) {
+    if (listen(atomic_load(&g_listen_fd), SOMAXCONN) < 0) {
         perror("listen");
         close_listen_socket();
         return -1;
@@ -65,18 +78,25 @@ int server_start(int port)
 
     fprintf(stderr, "Server listening on port %d\n", port);
 
-    while (!g_stop_requested) {
-        int client_fd = accept(g_listen_fd, NULL, NULL);
+    while (!atomic_load(&g_stop_requested)) {
+        int listen_fd = atomic_load(&g_listen_fd);
+        int client_fd;
+
+        if (listen_fd < 0) {
+            break;
+        }
+
+        client_fd = accept(listen_fd, NULL, NULL);
 
         if (client_fd < 0) {
             if (errno == EINTR) {
-                if (g_stop_requested) {
+                if (atomic_load(&g_stop_requested)) {
                     break;
                 }
                 continue;
             }
 
-            if (g_stop_requested) {
+            if (atomic_load(&g_stop_requested)) {
                 break;
             }
 
@@ -85,7 +105,7 @@ int server_start(int port)
         }
 
         fprintf(stderr, "Accepted connection on port %d\n", port);
-        handle_connection(client_fd);
+        g_connection_handler(client_fd);
     }
 
     close_listen_socket();
@@ -94,6 +114,11 @@ int server_start(int port)
 
 void server_stop(void)
 {
-    g_stop_requested = 1;
-    close_listen_socket();
+    atomic_store(&g_stop_requested, 1);
+    shutdown_listen_socket();
+}
+
+void server_set_connection_handler_for_test(void (*handler)(int))
+{
+    g_connection_handler = (handler != NULL) ? handler : handle_connection;
 }

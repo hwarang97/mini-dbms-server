@@ -273,6 +273,69 @@ static void test_shutdown_wakes_blocked_pushers(void)
     queue_destroy(queue);
 }
 
+/* capacity가 0이면 큐 초기화가 실패해야 한다. */
+static void test_queue_init_rejects_zero_capacity(void)
+{
+    assert(queue_init(0) == NULL);
+}
+
+/* NULL job은 shutdown 신호와 의미가 겹치므로 push에서 거부해야 한다. */
+static void test_queue_push_rejects_null_job(void)
+{
+    job_queue_t *queue = queue_init(2);
+
+    assert(queue != NULL);
+    assert(queue_push(queue, NULL) == -1);
+
+    queue_destroy(queue);
+}
+
+/* shutdown 이후에도 큐에 남아 있던 job은 먼저 drain한 뒤 NULL을 반환해야 한다. */
+static void test_shutdown_drains_remaining_jobs_before_null(void)
+{
+    job_queue_t *queue = queue_init(4);
+    job_t jobs[3];
+
+    assert(queue != NULL);
+
+    jobs[0].client_fd = 10;
+    jobs[0].sql = NULL;
+    jobs[1].client_fd = 11;
+    jobs[1].sql = NULL;
+    jobs[2].client_fd = 12;
+    jobs[2].sql = NULL;
+
+    assert(queue_push(queue, &jobs[0]) == 0);
+    assert(queue_push(queue, &jobs[1]) == 0);
+    assert(queue_push(queue, &jobs[2]) == 0);
+
+    queue_shutdown(queue);
+
+    assert(queue_pop(queue) == &jobs[0]);
+    assert(queue_pop(queue) == &jobs[1]);
+    assert(queue_pop(queue) == &jobs[2]);
+    assert(queue_pop(queue) == NULL);
+
+    queue_destroy(queue);
+}
+
+/* shutdown 이후 새 push는 즉시 거부되어야 한다. */
+static void test_queue_push_rejects_after_shutdown(void)
+{
+    job_queue_t *queue = queue_init(2);
+    job_t job;
+
+    assert(queue != NULL);
+
+    job.client_fd = 77;
+    job.sql = NULL;
+
+    queue_shutdown(queue);
+    assert(queue_push(queue, &job) == -1);
+
+    queue_destroy(queue);
+}
+
 /* 다중 스레드 workload를 돌려 job 유실이나 중복이 없는지 확인한다. */
 static void run_multi_producer_consumer_case(int producer_count, int consumer_count,
     int jobs_per_producer, size_t capacity)
@@ -367,9 +430,13 @@ static void test_stress_queue(void)
 /* Part 4 큐 테스트 전체를 실행한다. */
 int main(void)
 {
+    test_queue_init_rejects_zero_capacity();
+    test_queue_push_rejects_null_job();
     test_single_producer_single_consumer();
     test_shutdown_wakes_blocked_poppers();
     test_shutdown_wakes_blocked_pushers();
+    test_shutdown_drains_remaining_jobs_before_null();
+    test_queue_push_rejects_after_shutdown();
     test_multiple_producers_multiple_consumers();
     test_stress_queue();
     printf("test_queue passed\n");

@@ -30,13 +30,17 @@ RESOURCE_CHECK_SCRIPTS = \
 	scripts/check_leaks.sh \
 	scripts/check_races.sh \
 	scripts/check_fd.sh
+E2E_SCRIPT = scripts/run_e2e.sh
 
-.PHONY: all clean test check-leaks check-races check-fd check-resources
+.PHONY: all clean test e2e check-leaks check-races check-fd check-resources
 
 all: bin/dbms_server
 
 test: $(TEST_BINS)
 	@set -e; for test_bin in $(TEST_BINS); do ./$$test_bin; done
+
+e2e: bin/dbms_server $(E2E_SCRIPT)
+	bash $(E2E_SCRIPT)
 
 check-leaks: bin/dbms_server $(RESOURCE_CHECK_SCRIPTS)
 	bash scripts/check_leaks.sh

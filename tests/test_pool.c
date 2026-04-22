@@ -44,12 +44,11 @@ static char *duplicate_string(const char *value)
 
 static job_t *make_job(size_t index)
 {
-    char sql[64];
+    const char *sql = "SELECT * FROM users";
     int pipe_fds[2];
     job_t *job;
 
     assert(pipe(pipe_fds) == 0);
-    snprintf(sql, sizeof(sql), "SELECT %zu", index);
 
     job = (job_t *)malloc(sizeof(*job)); /* worker frees after process_job */
     assert(job != NULL);
@@ -142,6 +141,90 @@ static void close_read_fds(size_t count)
     }
 }
 
+static char *read_all_from_fd(int fd)
+{
+    size_t capacity = 512;
+    size_t length = 0;
+    char *buffer = (char *)malloc(capacity);
+
+    assert(buffer != NULL);
+
+    for (;;) {
+        ssize_t bytes_read;
+        char *grown_buffer;
+
+        if (length + 256 >= capacity) {
+            capacity *= 2;
+            grown_buffer = (char *)realloc(buffer, capacity);
+            assert(grown_buffer != NULL);
+            buffer = grown_buffer;
+        }
+
+        bytes_read = read(fd, buffer + length, capacity - length - 1);
+        assert(bytes_read >= 0);
+
+        if (bytes_read == 0) {
+            break;
+        }
+
+        length += (size_t)bytes_read;
+    }
+
+    buffer[length] = '\0';
+    return buffer;
+}
+
+static char *run_job_and_collect_response(const char *sql)
+{
+    int pipe_fds[2];
+    job_queue_t *queue;
+    job_t *job;
+    char *response;
+
+    assert(pipe(pipe_fds) == 0);
+
+    queue = queue_init(4);
+    assert(queue != NULL);
+
+    job = (job_t *)malloc(sizeof(*job)); /* worker frees after process_job */
+    assert(job != NULL);
+    job->client_fd = pipe_fds[1];
+    job->sql = duplicate_string(sql); /* worker frees after process_job */
+
+    pool_set_queue_hooks_for_test(NULL, NULL);
+
+    assert(pool_init(1, queue) == 0);
+    assert(queue_push(queue, job) == 0);
+
+    pool_shutdown();
+    response = read_all_from_fd(pipe_fds[0]);
+
+    assert_worker_closed_fd(pipe_fds[1]);
+
+    close(pipe_fds[0]);
+    pool_destroy();
+    queue_destroy(queue);
+
+    return response;
+}
+
+static void test_pool_init_rejects_invalid_arguments(void)
+{
+    job_queue_t *fake_queue = (job_queue_t *)&fake_queue_token;
+
+    reset_mock(MOCK_BLOCK_UNTIL_SHUTDOWN);
+    pool_set_queue_hooks_for_test(mock_queue_pop, mock_queue_shutdown);
+
+    assert(pool_init(0, fake_queue) == -1);
+    assert(pool_init(TEST_WORKER_COUNT, NULL) == -1);
+
+    assert(pool_init(TEST_WORKER_COUNT, fake_queue) == 0);
+    assert(pool_init(1, fake_queue) == -1);
+
+    pool_shutdown();
+    pool_destroy();
+}
+
 static void test_workers_process_jobs(void)
 {
     size_t i;
@@ -165,6 +248,30 @@ static void test_workers_process_jobs(void)
     pool_destroy();
 }
 
+static void test_worker_writes_success_response(void)
+{
+    char *response = run_job_and_collect_response("SELECT * FROM users");
+
+    assert(strstr(response, "HTTP/1.1 200 OK\r\n") != NULL);
+    assert(strstr(response, "Content-Type: application/json\r\n") != NULL);
+    assert(strstr(response, "\"status\":\"ok\"") != NULL);
+    assert(strstr(response, "\"rows\":[") != NULL);
+    assert(strstr(response, "\"alice\"") != NULL);
+
+    free(response);
+}
+
+static void test_worker_writes_error_response_on_query_failure(void)
+{
+    char *response = run_job_and_collect_response("THIS IS NOT VALID SQL");
+
+    assert(strstr(response, "HTTP/1.1 500 Internal Server Error\r\n") != NULL);
+    assert(strstr(response, "Content-Length: 2\r\n") != NULL);
+    assert(strstr(response, "\r\n\r\n{}") != NULL);
+
+    free(response);
+}
+
 static void test_shutdown_joins_idle_workers(void)
 {
     job_queue_t *fake_queue = (job_queue_t *)&fake_queue_token;
@@ -182,7 +289,10 @@ static void test_shutdown_joins_idle_workers(void)
 
 int main(void)
 {
+    test_pool_init_rejects_invalid_arguments();
     test_workers_process_jobs();
+    test_worker_writes_success_response();
+    test_worker_writes_error_response_on_query_failure();
     test_shutdown_joins_idle_workers();
     pool_set_queue_hooks_for_test(NULL, NULL);
 
